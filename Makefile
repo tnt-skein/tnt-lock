@@ -1,0 +1,73 @@
+# Проверки пакета: форматирование, линт, тесты, покрытие, мутанты.
+
+LUATEST  := .rocks/bin/luatest
+LUACHECK := .rocks/bin/luacheck
+COVERAGE_MIN ?= 100
+
+.PHONY: help
+help: ## Список целей
+	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN { FS = ":.*?## " } { printf "  %-12s %s\n", $$1, $$2 }'
+
+# cluacov считает исполняемые строки по байткоду: без него luacov относит
+# попадание в выражение на несколько строк к последней из них, и первая
+# строка константы числится непокрытой. Собирается под LuaJIT с GC64,
+# как у Tarantool: без флага рок на x86_64 роняет процесс.
+CLUACOV_CFLAGS := CFLAGS="-O2 -fPIC -DLUAJIT_ENABLE_GC64"
+
+# Собранный cluacov проверяется сразу: подсказка нужна и тогда, когда
+# рок роняет процесс, а не отвечает ошибкой. Скобки держат `||` на этой
+# проверке — иначе подсказка печаталась бы и на отказе предыдущего шага.
+CLUACOV_CHECK := { tarantool -e "local lines = require('cluacov.deepactivelines').get(loadstring('local a = 1\nreturn a')) \
+	os.exit((lines[1] and lines[2]) and 0 or 1)" || \
+	{ echo 'cluacov собран не под LuaJIT этого Tarantool: см. CLUACOV_CFLAGS в Makefile' >&2; false; }; }
+
+# Зависимости пакета — с сервера роков tnt-skein, по rockspec. Клиент etcd
+# пакету приходит аргументом и зависимостью не объявлен, а проверкам нужен:
+# у него живёт двойник хранилища решений, против которого проверяется замок.
+.PHONY: deps
+deps: ## Поставить зависимости пакета и инструменты проверок в .rocks
+	tt rocks install --server=https://luarocks.org luatest
+	tt rocks install --server=https://luarocks.org luacheck 1.2.0
+	tt rocks install --server=https://luarocks.org luacov 0.17.0
+	tt rocks install --server=https://luarocks.org cluacov 1.0.0 $(CLUACOV_CFLAGS) && \
+	$(CLUACOV_CHECK)
+	tt rocks install --server=https://tnt-skein.github.io/rocks --only-deps tnt-lock-scm-1.rockspec
+	tt rocks install --server=https://tnt-skein.github.io/rocks tnt-etcd-client
+
+.PHONY: fmt
+fmt: ## Отформатировать код
+	stylua .
+
+.PHONY: fmt-check
+fmt-check: ## Проверить форматирование, ничего не меняя
+	stylua --check .
+
+.PHONY: lint
+lint: ## Линт
+	$(LUACHECK) . --formatter plain --codes
+
+.PHONY: test
+test: ## Прогон проверок
+	$(LUATEST) test/
+
+.PHONY: coverage
+coverage: ## Проверки с покрытием и порогом
+	mkdir -p var && rm -f var/luacov.stats.out
+	$(LUATEST) test/ --coverage
+	tarantool tools/coverage_gate.lua $(COVERAGE_MIN)
+
+# Мутационное тестирование — утилитой tnt-mutants (github.com/tnt-skein/tnt-mutants).
+.PHONY: mutants
+mutants: ## Мутационное тестирование изменённых модулей
+	tnt-mutants
+
+.PHONY: mutants-all
+mutants-all: ## Мутационное тестирование всех модулей
+	tnt-mutants $(shell find tnt -name '*.lua' | sort)
+
+.PHONY: check
+check: fmt-check lint test coverage ## Все проверки, кроме мутантов
+
+.PHONY: clean
+clean: ## Убрать рабочие каталоги
+	rm -rf var
